@@ -8,9 +8,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.autograd import Variable
-from scipy.misc import face
 
-print("Changed")
+### Macros ###
+finalSparsityLevel = 0.4
+epochs = 2
+toPrune = False
+### Macros ###
 
 transform = transforms.Compose(
         [transforms.ToTensor(),
@@ -47,9 +50,9 @@ class Net(nn.Module):
         self.maxSparse = 0.5
         self.Dropout = nn.Dropout(0.25)# Not sure about this one 
 
-    def forward(self, x):
+    def forward(self, x_i):
         self.counter +=self.step
-        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv1(x_i))
         x = F.relu(self.conv2(x))
         x = self.pool(x)
         x = self.Dropout(x)
@@ -74,6 +77,7 @@ def testNet(net,testSet,device):
         #tensor_image = tensor_image.view(tensor_image.shape[1],tensor_image.shape[2], tensor_image.shape[0])
         images, labels = Variable(images).to(device), Variable(labels).to(device)
         output = net(images)
+        # Also no need to one hot encode because we are comparing indexes
         _, predicted = torch.max(output.data,1)
         total += labels.size(0)
         correct += (predicted == labels).sum()
@@ -81,23 +85,84 @@ def testNet(net,testSet,device):
     print("Accuracy of the network is : {}".format(finalAcc))
     return finalAcc
 
+def pruneLayers(net,pruneLevel):
+    prune.l1_unstructured(
+        module=net.conv1,
+        name="weight", amount=pruneLevel)
+    prune.l1_unstructured(
+        module=net.conv2, name="weight", amount=pruneLevel)
+    prune.l1_unstructured(
+        module=net.conv3, name="weight", amount=pruneLevel)
+    prune.l1_unstructured(
+        module=net.conv4, name="weight", amount=pruneLevel)
+    returno =[1 - (torch.count_nonzero(net.conv1.weight) / torch.numel(net.conv1.weight)),
+              (1- torch.count_nonzero(net.conv2.weight) / torch.numel(net.conv2.weight)),
+              (1- torch.count_nonzero(net.conv3.weight) / torch.numel(net.conv3.weight)),
+              (1- torch.count_nonzero(net.conv4.weight) / torch.numel(net.conv4.weight))]
+    print("This are the stats : ")
+    print(returno)
+    return returno
+
+def extractVOG(net,testSet,device):
+    # Lets do the VOG thing here
+    print("Evaluating VOG")
+    counter = 0
+    net.eval()  # Turn training
+    grads = []
+    for images,labels in testSet:# Per batch
+        images, labels = Variable(images).to(device), Variable(labels).to(device)
+        labelsShape = labels.shape
+        ones  = torch.ones(labelsShape)
+        #images.requires_grad = True
+        #input = transform(images[0])
+        input = images[0]
+        input.unsqueeze_(0)
+        input.requires_grad=True
+        #logits = net(images)
+        preds = net(input)
+        #layer_softMax = torch.nn.Softmax(dim=1)(logits)
+        score, indices = torch.max(preds,1)
+        # the tensor.type below casts the tensor into a LongTensor type(rather than float i think)
+        #sel_nodes = layer_softMax[torch,torch.arange(len(labels),labels.type(torch.LongTensor))]# I dont understand much why this is happening
+#        layer_softMax.backward(ones)
+        score.backward()
+        grads.append(input.grad.cpu().data.numpy())
+        counter += 1
+        if counter > 1:
+            break
+    print("Finished VOG Evaluation")
+    return grads
 
 net = Net()
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.SGD(net.parameters(),lr=0.001,momentum=0.9)
 amnt = 0;
 device = torch.device('cuda' if torch.cuda.is_available else 'cpu')
+print("Device is : {}".format(device))
 net.to(device)
-for epoch in range(20):  # loop over the dataset multiple times
 
+curSparsityVal = 0.0
+previousSparsityLevel = 0.0
+pruneRes = []
+lossPerEp = []
+
+for epoch in range(epochs):  # loop over the dataset multiple times
+    net.train()
     running_loss = 0.0
     amnt = int(epoch/2)
+    curSparsityVal = finalSparsityLevel - finalSparsityLevel*pow(1-(epoch/epochs),3)
+    print("Current Sparsity level = {}".format(curSparsityVal))
+    print("On epoch : {}, amount of sparsifying is : {}".format(epoch,curSparsityVal-previousSparsityLevel))
     #print(list(net.conv1.named_buffers()))
-    for i, data in enumerate(trainloader, 0):#For each batch 
+    if toPrune:# Pruning here(if enabled)
+        pruneRes.append(pruneLayers(net,curSparsityVal-previousSparsityLevel ))
+
+    # Per batch
+    for i, data in enumerate(trainloader, 0):#For each batch
         # get the inputs; data is a list of [inputs, labels]
         inputs, labels = data
         inputs, labels = Variable(inputs).to(device), Variable(labels).cuda()
-        
+
 
         # reset the parameters to zero
         optimizer.zero_grad()
@@ -105,6 +170,7 @@ for epoch in range(20):  # loop over the dataset multiple times
         # forward + backward + optimize
         outputs = net(inputs)
         #print("Gradients size : {}".format(net.conv1))
+        # No need to one-hot encode because criterion takes index labels
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
@@ -117,18 +183,38 @@ for epoch in range(20):  # loop over the dataset multiple times
         #          (epoch + 1, i + 1, running_loss / 2000))
         #    running_loss = 0.0
     print("Loss in epoch {}, is : {}".format(epoch,running_loss/50000))
+    lossPerEp.append(running_loss/50000)
+    previousSparsityLevel = curSparsityVal
+
+
+
+print("Now printing results of sparsification with net:")
+ax1 = plt.subplot(211,title="Error")
+plt.plot(np.arange(0,epochs),lossPerEp,color='red',linestyle='dashed')
+plt.subplot(212,sharex=ax1, title="Pruning Stats")
+pruneRes = np.array([j.to('cpu') for i in pruneRes for j in i])
+pruneRes = np.resize(pruneRes,(epochs,4))
+plt.plot(pruneRes)
+plt.show()
+
+### Testing Net ####
+testNet(net,testloader,device)
+
+### Extracting Gradients ###
+grads = extractVOG(net,testloader,device)
+ax1 = plt.subplot(211,title="Original Image")
+plt.imshow(np.moveaxis(np.asarray(testset[0][0].cpu()),0,-1).astype('uint8'))
+ax2 = plt.subplot(212,title="Gradient Image")
+plt.imshow(np.moveaxis(grads[0][0],0,-1))
+
+plt.show()
 
 # We need to verify this b
-testNet(net,testloader,device)
 #plt.plot(running_loss)
 #plt.show()
 print("This is the resulting thing : {}".format(net.conv1.named_parameters()))
 print("This is are the weights")
-prune.l1_unstructured(
-        module=net.conv1,
-        name="weight",amount=0.5)
 #print(net.gradHist)
 print(net.conv1.weight)
 
 print('Finished Training')
-
